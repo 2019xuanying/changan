@@ -37,16 +37,15 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 CONFIG_FILE = "config.json"
 
-# 全局状态字典，新增了 traffic 字段用于存放流量数据
+# 🌟 新增：线程唤醒事件
+sync_event = threading.Event()
+
 cached_data = {
-    "status": {}, 
-    "location": {}, 
-    "traffic": {"left": "0", "unit": "MB", "expireDate": "--"},
-    "last_update": "尚未获取"
+    "status": {}, "location": {}, "traffic": {"left": "--", "unit": "", "expireDate": "--"}, 
+    "report": {}, "report_yesterday": {}, "messages": [], "last_update": "系统启动中..."
 }
 current_config = {"carId": "", "token": "", "fetch_interval": 900}
 
-# ================= 加载与保存配置 =================
 def load_config():
     global current_config
     if os.path.exists(CONFIG_FILE):
@@ -59,124 +58,83 @@ def save_config(config_data):
 
 load_config()
 
-# ================= 后台抓取线程 =================
-def fetch_changan_data():
+def fetch_data_thread():
     global cached_data
     while True:
         if current_config.get("token") and current_config.get("carId"):
+            headers = {
+                "Host": "m.iov.changan.com.cn",
+                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_7_15 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148",
+                "vcs-app-id": "inCall",
+                "X-VCS-User-Token": current_config['token']
+            }
+            token = current_config['token']
+            carId = current_config['carId']
+            
+            # --- 执行抓取逻辑 ---
             try:
-                headers = {
-                    "Host": "m.iov.changan.com.cn",
-                    "User-Agent": "TestApp/2.2.3 (com.changan.uni; build:223036; iOS 16.7.15) Alamofire/5.11.0",
-                    "vcs-app-id": "inCall"
-                }
-                
-                # 1. 获取车况核心数据 (注意 keys=%2A 已经修复)
-                post_headers = headers.copy()
-                post_headers["Content-Type"] = "application/x-www-form-urlencoded; charset=utf-8"
-                payload = f"carId={current_config['carId']}&keys=%2A&token={current_config['token']}"
-                
-                res_data = requests.post("https://m.iov.changan.com.cn/app2/api/car/data", headers=post_headers, data=payload, timeout=10).json()
-                
-                if res_data.get("success"):
-                    car = res_data["data"]
-                    cached_data["status"] = {
-                        "gpsTime": car.get("gpsTime", "未知"),
-                        "totalOdometer": car.get("totalOdometer", 0),
-                        "fuelLeftover": car.get("fuelLeftover", 0),
-                        "remainedOilMile": car.get("remainedOilMile", 0),
-                        "batteryVoltage": car.get("batteryVoltage", 0),
-                        "lfTyrePressure": car.get("lfTyrePressure", 0),
-                        "rfTyrePressure": car.get("rfTyrePressure", 0),
-                        "lrTyrePressure": car.get("lrTyrePressure", 0),
-                        "rrTyrePressure": car.get("rrTyrePressure", 0),
-                        "engineStatus": car.get("engineStatus", 2),
-                        "leftFrontDoorLock": car.get("leftFrontDoorLock", 0),
-                        "trunk": car.get("trunk", 0),
-                        "hood": car.get("hood", 0),
-                        "airConditioningSetTemperature": car.get("airConditioningSetTemperature", 0),
-                        "environmentalTemp": car.get("environmentalTemp", 0)
-                    }
+                # 1. 基础车况
+                payload = f"carId={carId}&keys=%2A&token={token}"
+                res_status = requests.post("https://m.iov.changan.com.cn/app2/api/car/data", 
+                                    headers={**headers, "Content-Type": "application/x-www-form-urlencoded; charset=utf-8"}, 
+                                    data=payload, timeout=10).json()
+                if res_status.get("success"): cached_data["status"] = res_status.get("data", {})
 
-                # 2. 获取实时定位
-                loc_url = f"https://m.iov.changan.com.cn/app2/api/car/location?carId={current_config['carId']}&mapType=GCJ02&token={current_config['token']}"
-                res_loc = requests.get(loc_url, headers=headers, timeout=10).json()
-                if res_loc.get("success"):
-                    loc = res_loc["data"]
-                    cached_data["location"] = {
-                        "city": loc.get("city", ""), 
-                        "address": loc.get("address", ""),
-                        "lat": loc.get("lat", 0), 
-                        "lng": loc.get("lng", 0)
-                    }
+                # 2. 定位
+                res_loc = requests.get(f"https://m.iov.changan.com.cn/app2/api/car/location?carId={carId}&mapType=GCJ02&token={token}", headers=headers, timeout=10).json()
+                if res_loc.get("success"): cached_data["location"] = res_loc.get("data", {})
 
-                # 3. 获取车机娱乐流量
-                traffic_url = f"https://m.iov.changan.com.cn/app2/api/mall/digital/balance/app?carId={current_config['carId']}&token={current_config['token']}"
-                res_traffic = requests.get(traffic_url, headers=headers, timeout=10).json()
-                if res_traffic.get("success") and res_traffic["data"]:
-                    traffic_info = res_traffic["data"][0]["balances"][0]
-                    cached_data["traffic"] = {
-                        "left": traffic_info.get("left", "0"),
-                        "unit": traffic_info.get("unit", "MB"),
-                        "expireDate": traffic_info.get("expirationTime", "").split(" ")[0] # 截取年月日
-                    }
+                # 3. 流量
+                res_tra = requests.get(f"https://m.iov.changan.com.cn/app2/api/mall/digital/balance/app?carId={carId}&token={token}", headers=headers, timeout=10).json()
+                if res_tra.get("success") and res_tra.get("data"): 
+                    traffic_info = res_tra["data"][0]["balances"][0]
+                    cached_data["traffic"] = {"left": traffic_info.get("left", "0"), "unit": traffic_info.get("unit", "MB"), "expireDate": traffic_info.get("expirationTime", "").split(" ")[0]}
 
-                cached_data["last_update"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                print(f"[成功] 数据已更新: {cached_data['last_update']}")
-                
-            except Exception as e:
-                print(f"[错误] 数据拉取失败: {e}")
+                # 4. 今日行程 & 昨日行程
+                today = time.strftime('%Y%m%d')
+                yesterday = time.strftime('%Y%m%d', time.localtime(time.time() - 86400))
+                for q_day, key in [(today, "report"), (yesterday, "report_yesterday")]:
+                    res_rep = requests.get(f"https://m.iov.changan.com.cn/app2/api/car-report/car-report-day?carId={carId}&queryDay={q_day}&token={token}", headers=headers, timeout=10).json()
+                    if res_rep.get("success"): cached_data[key] = res_rep.get("data", {})
+
+                # 5. 消息
+                start_time = time.strftime('%Y-%m-%d', time.localtime(time.time() - 2592000)) + "+00:00:00"
+                end_time = time.strftime('%Y-%m-%d') + "+23:59:59"
+                res_msg = requests.get(f"https://m.iov.changan.com.cn/appserver/api/information/getAllLatestInfo?actionType=1&startTime={start_time}&endTime={end_time}&token={token}", headers=headers, timeout=10).json()
+                if res_msg.get("success"): cached_data["messages"] = res_msg.get("data", [])[:5]
+
+                cached_data["last_update"] = time.strftime("%H:%M:%S")
+            except Exception as e: print(f"[错误] 数据更新异常: {e}")
         
-        # 如果还没配置 Token，每 10 秒检查一次；如果已配置，按设定间隔 (15分钟) 休眠防风控
-        sleep_time = current_config.get("fetch_interval", 900) if current_config.get("token") else 10
-        time.sleep(sleep_time)
+        # 🌟 关键点：线程在这里等待，如果手动调用了 sync_event.set()，它会立刻醒来
+        sync_event.wait(timeout=current_config.get("fetch_interval", 900) if current_config.get("token") else 10)
+        sync_event.clear() # 重置信号，开始下一次定时循环
 
-# 启动后台独立线程，不阻塞主程序
-threading.Thread(target=fetch_changan_data, daemon=True).start()
-
-# ================= Flask 路由接口 =================
+threading.Thread(target=fetch_data_thread, daemon=True).start()
 
 @app.route('/')
 def index():
-    # 绕过 Jinja2 模板渲染引擎，直接读取 HTML 文件返回，彻底解决 500 报错
-    try:
-        with open('templates/index.html', 'r', encoding='utf-8') as f:
-            return f.read()
-    except FileNotFoundError:
-        return "找不到前端模板文件，请确保 templates/index.html 存在。", 404
+    with open('templates/index.html', 'r', encoding='utf-8') as f: return f.read()
 
-@app.route('/api/car-status', methods=['GET'])
-def get_car_status():
-    """提供给前端拉取数据的核心接口"""
-    return jsonify({
-        "code": 200, 
-        "data": cached_data, 
-        "has_config": bool(current_config.get("token"))
-    })
+@app.route('/api/car-status')
+def status():
+    return jsonify({"code": 200, "data": cached_data, "has_config": bool(current_config.get("token"))})
+
+# 🌟 新增：强制同步路由
+@app.route('/api/force-sync', methods=['POST'])
+def force_sync():
+    sync_event.set()
+    return jsonify({"code": 200, "msg": "正在同步..."})
 
 @app.route('/api/config', methods=['GET', 'POST'])
-def handle_config():
-    """处理前端提交的 Token 保存请求"""
+def config():
     global current_config
     if request.method == 'POST':
-        data = request.json
-        current_config["carId"] = data.get("carId", "").strip()
-        current_config["token"] = data.get("token", "").strip()
+        current_config.update(request.json)
         save_config(current_config)
-        
-        # 强制唤醒或重启获取逻辑（简单的状态重置）
-        return jsonify({"code": 200, "message": "配置已保存，系统将在后台重新获取数据"})
-        
-    return jsonify({
-        "code": 200, 
-        "data": {
-            "carId": current_config.get("carId"), 
-            "token": current_config.get("token")
-        }
-    })
+    return jsonify({"code": 200, "data": current_config})
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+if __name__ == '__main__': app.run(host='0.0.0.0', port=5000)
 EOF_PYTHON
 
 # ==========================================
@@ -189,245 +147,341 @@ cat << 'EOF_HTML' > templates/index.html
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>UNI-V 车况实时看板</title>
+    <title>UNI-V 全景监控舱</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <style>
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: rgba(15, 23, 42, 0.5); }
+        ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: #10b981; }
+        .diagnostic-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 1rem; }
+    </style>
 </head>
-<body class="bg-slate-900 text-white min-h-screen p-4 md:p-6 font-sans selection:bg-emerald-500 selection:text-white">
-    <div id="app" class="max-w-4xl mx-auto">
+<body class="bg-slate-900 text-slate-200 min-h-screen p-4 md:p-6 font-sans">
+    <div id="app" class="max-w-7xl mx-auto relative">
         
-        <header class="flex flex-col md:flex-row justify-between md:items-end border-b border-slate-700 pb-4 mb-6 gap-4">
+        <!-- ================= 头部栏 ================= -->
+        <header class="flex flex-col md:flex-row justify-between md:items-end border-b border-slate-700/80 pb-5 mb-6 gap-4">
             <div>
-                <h1 class="text-3xl font-bold text-emerald-400 tracking-wider">UNI-V <span class="text-slate-500 text-xl font-normal">| 实时终端</span></h1>
-                <p class="text-slate-400 text-sm mt-1">Changan Telematics Dashboard</p>
+                <h1 class="text-3xl font-bold text-emerald-400 tracking-wide">UNI-V <span class="text-slate-500 text-xl font-normal">| 终极监控舱</span></h1>
             </div>
-            <div class="flex items-center gap-4 self-end md:self-auto">
-                <div class="text-right">
-                    <p class="text-xs text-slate-400 uppercase tracking-wider">Last Sync</p>
-                    <p class="text-lg font-mono text-emerald-300">{{ lastUpdate }}</p>
+            <div class="flex items-center gap-4">
+                <div class="text-right mr-2">
+                    <p class="text-[11px] text-slate-500 tracking-widest">最后同步</p>
+                    <p class="text-base font-mono text-emerald-300">{{ lastUpdate }}</p>
                 </div>
-                <button @click="showSettings = true" class="p-2.5 bg-slate-800 rounded-lg border border-slate-600 hover:bg-slate-700 hover:border-emerald-500 transition-all group">
-                    <svg class="w-5 h-5 text-slate-300 group-hover:text-emerald-400 transition-colors" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+                
+                <!-- 开发者抽屉按钮 -->
+                <button @click="showDiagnostics = true" class="p-2.5 bg-slate-800 rounded-lg border border-slate-600 hover:bg-slate-700 hover:border-blue-500 transition-all text-slate-300 hover:text-blue-400 shadow-lg group relative" title="全部原始数据流">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4m0 5c0 2.21-3.582 4-8 4s-8-1.79-8-4"></path></svg>
+                    <span class="absolute -top-2 -right-2 flex h-3 w-3"><span class="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span><span class="relative inline-flex rounded-full h-3 w-3 bg-blue-500"></span></span>
+                </button>
+
+                <!-- 设置按钮 -->
+                <button @click="showSettings = true" class="p-2.5 bg-slate-800 rounded-lg border border-slate-600 hover:bg-slate-700 hover:border-emerald-500 transition-all text-slate-300 hover:text-emerald-400 shadow-lg">
+                    <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
                 </button>
             </div>
         </header>
 
-        <div v-if="showSettings" class="fixed inset-0 bg-black/70 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-            <div class="bg-slate-800 p-6 rounded-2xl border border-slate-600 w-full max-w-md shadow-2xl">
-                <div class="flex justify-between items-center mb-5">
-                    <h2 class="text-xl font-bold text-slate-100">系统配置</h2>
-                    <button @click="showSettings = false" class="text-slate-400 hover:text-white">✕</button>
+        <div v-if="!hasConfig" class="text-center py-20 bg-slate-800/30 border border-slate-700 border-dashed rounded-xl">
+            <p class="text-slate-300">尚未配置车机 Token，请点击右上角设置</p>
+        </div>
+
+        <div v-else>
+            <!-- ================= 顶部四大核心卡片 ================= -->
+            <div class="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
+                <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 flex items-center gap-4 shadow-lg">
+                    <div class="bg-blue-500/10 p-3 rounded-xl text-blue-400"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 20l-5.447-2.724A1 1 0 013 16.382V5.618a1 1 0 011.447-.894L9 7m0 13l6-3m-6 3V7m6 10l4.553 2.276A1 1 0 0021 18.382V7.618a1 1 0 00-.553-.894L15 4m0 13V4m0 0L9 7"></path></svg></div>
+                    <div><p class="text-xs text-slate-400 mb-0.5">总里程</p><p class="font-bold text-xl">{{ status.totalOdometer || 0 }} <span class="text-xs font-normal text-slate-500">km</span></p></div>
                 </div>
-                <div class="space-y-4 text-left">
-                    <div>
-                        <label class="block text-sm text-slate-400 mb-1.5">车辆 ID (CarId)</label>
-                        <input v-model="configForm.carId" type="text" placeholder="输入 32 位 CarId" class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition-all text-slate-200">
-                    </div>
-                    <div>
-                        <label class="block text-sm text-slate-400 mb-1.5">访问令牌 (Token)</label>
-                        <textarea v-model="configForm.token" rows="3" placeholder="粘贴抓包获取的 Token" class="w-full bg-slate-900 border border-slate-600 rounded-lg px-3 py-2.5 text-sm font-mono focus:outline-none focus:border-emerald-500 focus:ring-1 focus:ring-emerald-500 transition-all text-slate-200 break-all"></textarea>
-                    </div>
+                <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 flex items-center gap-4 shadow-lg">
+                    <div class="bg-rose-500/10 p-3 rounded-xl text-rose-400"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path></svg></div>
+                    <div><p class="text-xs text-slate-400 mb-0.5">{{ status.igniteCumulativeMileage > 0 ? '本次里程' : '昨日里程' }}</p><p class="font-bold text-xl">{{ status.igniteCumulativeMileage > 0 ? status.igniteCumulativeMileage : (report_yesterday.todayMileage || 0) }} <span class="text-xs font-normal text-slate-500">km</span></p></div>
                 </div>
-                <div class="mt-8 flex justify-end gap-3">
-                    <button @click="showSettings = false" class="px-5 py-2.5 rounded-lg text-sm text-slate-300 hover:bg-slate-700 transition-colors">取消</button>
-                    <button @click="saveConfig" class="px-5 py-2.5 bg-emerald-600 hover:bg-emerald-500 rounded-lg text-sm font-medium transition-colors text-white shadow-lg shadow-emerald-900/50">保存并重启同步</button>
+                <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 flex items-center gap-4 shadow-lg">
+                    <div class="bg-amber-500/10 p-3 rounded-xl text-amber-400"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg></div>
+                    <div><p class="text-xs text-slate-400 mb-0.5">平均油耗</p><p class="font-bold text-xl">{{ status.fuelConsumption100km || 0 }} <span class="text-xs font-normal text-slate-500">L/100km</span></p></div>
+                </div>
+                <div class="bg-slate-800 p-4 rounded-xl border border-slate-700 flex items-center gap-4 shadow-lg">
+                    <div class="p-3 rounded-xl" :class="status.engineStatus === 2 ? 'bg-slate-700 text-slate-400' : 'bg-emerald-500/10 text-emerald-400'"><svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg></div>
+                    <div><p class="text-xs text-slate-400 mb-0.5">引擎状态</p><p class="font-bold text-lg" :class="status.engineStatus === 2 ? 'text-slate-400' : 'text-emerald-400'">{{ status.engineStatus === 2 ? '已熄火' : '运行中' }}</p></div>
                 </div>
             </div>
-        </div>
 
-        <div v-if="!hasConfig" class="text-center py-24 bg-slate-800/50 rounded-2xl border border-slate-700/50 border-dashed">
-            <svg class="w-16 h-16 mx-auto text-slate-600 mb-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"></path></svg>
-            <p class="text-slate-300 text-lg font-medium">系统尚未配置认证信息</p>
-            <p class="text-slate-500 mt-2 text-sm">请点击右上角设置按钮，填入抓包获取的 CarId 与 Token</p>
-            <button @click="showSettings = true" class="mt-6 px-6 py-2 bg-slate-700 hover:bg-slate-600 rounded-lg text-sm transition-colors text-white">立即配置</button>
-        </div>
+            <!-- ================= 主页三列数据区 ================= -->
+            <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                
+                <!-- 【第一列】动力系统 & 车辆健康 -->
+                <div class="space-y-6">
+                    <!-- 动力系统 (融合了单次行程细节) -->
+                    <div class="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg space-y-3.5 relative overflow-hidden">
+                        <div class="absolute -right-4 -top-4 w-24 h-24 bg-blue-500/10 rounded-full blur-xl"></div>
+                        <h2 class="text-sm font-bold text-blue-400 border-l-2 border-blue-500 pl-2 mb-4 uppercase">动力与行程系统</h2>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">剩余油量</span><span class="font-mono text-slate-200">{{ status.fuelLeftover || 0 }} L</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">油量百分比</span><span class="font-mono text-slate-200">{{ status.remainingFuel || 0 }} %</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">预计续航</span><span class="font-mono text-slate-200">{{ status.remainedOilMile || 0 }} km</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">电瓶电压</span><span class="font-mono text-slate-200">{{ status.batteryVoltage || '--' }} V</span></div>
+                        <div class="my-3 border-t border-slate-700/50"></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">当前车速 (表显)</span><span class="font-mono text-slate-200">{{ status.vehicleSpeed || 0 }} km/h</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">发动机转速</span><span class="font-mono text-slate-200">{{ status.engineSpeed || '--' }} rpm</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">发动机水温</span><span class="font-mono text-slate-200">{{ status.engineWaterTemp || '--' }} °C</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">机油压力</span><span :class="status.lowOilPressureFlag === 0 ? 'text-emerald-400' : 'text-red-400'">{{ status.lowOilPressureFlag === 0 ? '正常' : '异常' }}</span></div>
+                        <!-- 新增行程细节 -->
+                        <div class="my-3 border-t border-slate-700/50 pt-2 border-dashed"></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">本次点火时间</span><span class="font-mono text-slate-300 text-xs mt-0.5">{{ (status.ignitionTime || '').split(' ')[1] || '--:--:--' }}</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">本次耗油量</span><span class="font-mono text-amber-400">{{ status.igniteCumulativeOil || 0 }} L</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">GPS真实车速</span><span class="font-mono text-emerald-400">{{ status.speed || 0 }} km/h</span></div>
+                    </div>
+                    
+                    <!-- 车辆健康 (融合了深层底盘告警) -->
+                    <div class="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg space-y-3.5">
+                        <h2 class="text-sm font-bold text-emerald-400 border-l-2 border-emerald-500 pl-2 mb-4 uppercase">车辆健康与底盘自检</h2>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">距离保养剩余</span><span class="font-mono text-emerald-400">{{ status.maintainMileageRemaind || '--' }} km</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">ABS 防抱死</span><span :class="status.absStatus === 0 ? 'text-emerald-400' : 'text-red-400'">{{ status.absStatus === 0 ? '正常' : '报警' }}</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">ESP 稳定系统</span><span :class="status.vehicleStabilityControlSystemStatus === 0 ? 'text-emerald-400' : 'text-red-400'">{{ status.vehicleStabilityControlSystemStatus === 0 ? '正常' : '异常' }}</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">EPS 助力转向</span><span :class="status.assistantSteeringStatus === 0 ? 'text-emerald-400' : 'text-red-400'">{{ status.assistantSteeringStatus === 0 ? '正常' : '异常' }}</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">变速箱状态</span><span :class="status.transmissionSystemStatus === 0 ? 'text-emerald-400' : 'text-red-400'">{{ status.transmissionSystemStatus === 0 ? '正常' : '异常' }}</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">安全气囊</span><span :class="status.airbagSystemStatus === 0 ? 'text-emerald-400' : 'text-red-400'">{{ status.airbagSystemStatus === 0 ? '正常' : '异常' }}</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">冷却液温度</span><span :class="status.engineCoolantStatus === 0 ? 'text-emerald-400' : 'text-red-400'">{{ status.engineCoolantStatus === 0 ? '正常' : '高温报警' }}</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">钥匙电量</span><span :class="status.keyLowPower === 0 ? 'text-emerald-400' : 'text-amber-400'">{{ status.keyLowPower === 0 ? '正常' : '电量低' }}</span></div>
+                    </div>
+                </div>
 
-        <div v-else class="grid grid-cols-1 md:grid-cols-2 gap-5 md:gap-6">
+                <!-- 【第二列】门窗 & 座舱 & 网络 -->
+                <div class="space-y-6">
+                    <!-- 门窗状态 -->
+                    <div class="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg">
+                        <h2 class="text-sm font-bold text-purple-400 border-l-2 border-purple-500 pl-2 mb-4 uppercase">全车门窗监控</h2>
+                        <div class="grid grid-cols-2 gap-x-4 gap-y-3 text-sm">
+                            <div class="col-span-2 flex justify-between border-b border-slate-700/50 pb-2 mb-1"><span class="text-slate-400">全车车门落锁</span><span :class="status.leftFrontDoorLock === 0 ? 'text-emerald-400' : 'text-amber-400'">{{ status.leftFrontDoorLock === 0 ? '已落锁' : '存在未锁' }}</span></div>
+                            <div class="flex justify-between pr-2"><span class="text-slate-400">主驾车窗</span><span :class="status.diverWindow === 0 ? 'text-emerald-400' : 'text-amber-400'">{{ status.diverWindow === 0 ? '已关' : '开启' }}</span></div>
+                            <div class="flex justify-between pl-2"><span class="text-slate-400">副驾车窗</span><span :class="status.passengerWindow === 0 ? 'text-emerald-400' : 'text-amber-400'">{{ status.passengerWindow === 0 ? '已关' : '开启' }}</span></div>
+                            <div class="flex justify-between pr-2 border-t border-slate-700/50 pt-2"><span class="text-slate-400">左后车窗</span><span :class="status.leftRearWindow === 0 ? 'text-emerald-400' : 'text-amber-400'">{{ status.leftRearWindow === 0 ? '已关' : '开启' }}</span></div>
+                            <div class="flex justify-between pl-2 border-t border-slate-700/50 pt-2"><span class="text-slate-400">右后车窗</span><span :class="status.rightRearWindow === 0 ? 'text-emerald-400' : 'text-amber-400'">{{ status.rightRearWindow === 0 ? '已关' : '开启' }}</span></div>
+                            <div class="flex justify-between pr-2 border-t border-slate-700/50 pt-2"><span class="text-slate-400">天窗</span><span :class="status.sunroof === 0 ? 'text-emerald-400' : 'text-amber-400'">{{ status.sunroof === 0 ? '已关' : '开启' }}</span></div>
+                            <div class="flex justify-between pl-2 border-t border-slate-700/50 pt-2"><span class="text-slate-400">引擎盖</span><span :class="status.hood === 0 ? 'text-emerald-400' : 'text-red-400'">{{ status.hood === 0 ? '已关' : '开启' }}</span></div>
+                            <div class="col-span-2 flex justify-between border-t border-slate-700/50 pt-2"><span class="text-slate-400">后备箱</span><span :class="status.trunk === 0 ? 'text-emerald-400' : 'text-amber-400'">{{ status.trunk === 0 ? '已关' : '开启' }}</span></div>
+                        </div>
+                    </div>
+
+                    <!-- 座舱舒适配置 -->
+                    <div class="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg space-y-3.5">
+                        <h2 class="text-sm font-bold text-sky-400 border-l-2 border-sky-500 pl-2 mb-4 uppercase">座舱微气候与舒适</h2>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">空调设定</span><span class="font-mono text-slate-200">{{ status.airConditioningSetTemperature || '--' }} °C</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">车内/外实温</span><span class="font-mono text-slate-200">{{ status.air ? status.air.temperature : '--' }}°C / {{ status.environmentalTemp || '--' }}°C</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">内外循环状态</span><span class="text-slate-200 text-sm">{{ status.airRecycleStatus === 2 ? '外循环' : (status.airRecycleStatus === 1 ? '内循环' : '关闭') }}</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">车内 PM2.5 / 质量</span><span class="font-mono text-emerald-400">{{ status.pm25 !== undefined ? status.pm25 : '--' }} <span class="text-xs text-slate-500 ml-1">(LV:{{ status.airQualityInCarLevel || 0 }})</span></span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">净化器状态</span><span :class="status.airPurifierStatus === 1 ? 'text-emerald-400' : 'text-slate-400'">{{ status.airPurifierStatus === 1 ? '运行中' : '关闭' }}</span></div>
+                        
+                        <div class="grid grid-cols-2 gap-2 mt-3 pt-3 border-t border-slate-700/50">
+                            <div class="bg-slate-900/50 py-1.5 rounded flex flex-col items-center justify-center">
+                                <span class="text-[10px] text-slate-500 mb-0.5">主驾 加热/通风</span>
+                                <span class="text-xs text-slate-300"><span class="text-amber-400">{{ status.driverSeatHeatStatus === 6 ? '关' : status.driverSeatHeatStatus+'档' }}</span> <span class="mx-1 text-slate-600">|</span> <span class="text-sky-400">{{ status.driverSeatAirStatus === 6 ? '关' : status.driverSeatAirStatus+'档' }}</span></span>
+                            </div>
+                            <div class="bg-slate-900/50 py-1.5 rounded flex flex-col items-center justify-center">
+                                <span class="text-[10px] text-slate-500 mb-0.5">副驾 加热/通风</span>
+                                <span class="text-xs text-slate-300"><span class="text-amber-400">{{ status.passengerSeatHeatStatus === 6 ? '关' : status.passengerSeatHeatStatus+'档' }}</span> <span class="mx-1 text-slate-600">|</span> <span class="text-sky-400">{{ status.passengerSeatAirStatus === 6 ? '关' : status.passengerSeatAirStatus+'档' }}</span></span>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- 网络与流量 -->
+                    <div class="bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg space-y-3.5">
+                        <h2 class="text-sm font-bold text-indigo-400 border-l-2 border-indigo-500 pl-2 mb-4 uppercase">网络 & 流量</h2>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">信号强度</span><span class="font-mono text-slate-200">{{ status.signaIntensity || '--' }} %</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">剩余流量</span><span class="font-mono text-indigo-400 font-bold">{{ traffic.left || '--' }} {{ traffic.unit || '' }}</span></div>
+                        <div class="flex justify-between items-center"><span class="text-slate-400 text-sm">流量到期日</span><span class="font-mono text-slate-500 text-xs mt-0.5">{{ traffic.expireDate || '--' }}</span></div>
+                    </div>
+                </div>
+
+                <!-- 【第三列】 定位 & 灯光 & 消息 -->
+                <div class="space-y-6">
+                    <!-- 卫星定位 -->
+                    <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg relative overflow-hidden">
+                        <h2 class="text-sm font-bold text-rose-400 border-l-2 border-rose-500 pl-2 mb-3 uppercase">高精卫星定位</h2>
+                        <p class="text-slate-200 font-medium mb-1">{{ location.city || '刷新中...' }}</p>
+                        <p class="text-slate-500 text-xs mb-3 truncate">{{ location.address || '暂无详细道路数据' }}</p>
+                        <div class="grid grid-cols-2 gap-y-3 pt-3 border-t border-slate-700/50 mt-4">
+                            <div><p class="text-slate-500 text-[10px] mb-1">搜星数量</p><p class="font-mono text-sm text-slate-200">{{ status.satNum || 0 }} <span class="text-xs text-slate-500">颗</span></p></div>
+                            <div><p class="text-slate-500 text-[10px] mb-1">当前海拔</p><p class="font-mono text-sm text-slate-200">{{ status.alti || '--' }} <span class="text-xs text-slate-500">m</span></p></div>
+                            <div><p class="text-slate-500 text-[10px] mb-1">车头航向角</p><p class="font-mono text-sm text-slate-200">{{ status.heading || '--' }} <span class="text-xs text-slate-500">°</span></p></div>
+                            <div><p class="text-slate-500 text-[10px] mb-1">定位时间</p><p class="font-mono text-sm text-slate-200">{{ (status.gpsTime || '').split(' ')[1] || '--' }}</p></div>
+                        </div>
+                    </div>
+                    
+                    <!-- 全车灯光 -->
+                    <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg">
+                        <h2 class="text-sm font-bold text-amber-400 border-l-2 border-amber-500 pl-2 mb-4 uppercase">全车灯光系统</h2>
+                        <div class="grid grid-cols-2 gap-y-3 text-sm">
+                            <div class="flex justify-between pr-3"><span class="text-slate-400">近光灯</span><span :class="status.lowBeam === 1 ? 'text-amber-400' : 'text-slate-500'">{{ status.lowBeam === 1 ? '开启' : '关闭' }}</span></div>
+                            <div class="flex justify-between pl-3 border-l border-slate-700"><span class="text-slate-400">远光灯</span><span :class="status.highBeam === 1 ? 'text-blue-400' : 'text-slate-500'">{{ status.highBeam === 1 ? '开启' : '关闭' }}</span></div>
+                            <div class="flex justify-between pr-3"><span class="text-slate-400">前雾灯</span><span :class="status.frontFogLight === 1 ? 'text-amber-400' : 'text-slate-500'">{{ status.frontFogLight === 1 ? '开启' : '关闭' }}</span></div>
+                            <div class="flex justify-between pl-3 border-l border-slate-700"><span class="text-slate-400">后雾灯</span><span :class="status.rearFogLight === 1 ? 'text-red-400' : 'text-slate-500'">{{ status.rearFogLight === 1 ? '开启' : '关闭' }}</span></div>
+                            <div class="col-span-2 flex justify-between pt-2 border-t border-slate-700/50"><span class="text-slate-400">日行/示宽灯</span><span :class="status.positionLight === 1 ? 'text-emerald-400' : 'text-slate-500'">{{ status.positionLight === 1 ? '开启' : '关闭' }}</span></div>
+                        </div>
+                    </div>
+
+                    <!-- 消息中心 -->
+                    <div class="bg-slate-800 p-5 rounded-xl border border-slate-700 shadow-lg">
+                        <h2 class="text-sm font-bold text-slate-300 border-l-2 border-slate-400 pl-2 mb-3 uppercase">云端消息下发</h2>
+                        <div class="space-y-2 h-24 overflow-y-auto pr-2">
+                            <div v-for="msg in messages" class="border-b border-slate-700/50 pb-1.5">
+                                <p class="text-slate-300 text-xs leading-relaxed">{{ msg.title }}</p>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
             
-            <div class="bg-slate-800 rounded-2xl p-5 shadow-xl border border-slate-700/80 relative overflow-hidden">
-                <div class="absolute top-0 right-0 w-24 h-24 bg-emerald-500/10 rounded-bl-full -z-10"></div>
-                <h2 class="text-lg font-semibold mb-5 text-slate-200 flex items-center gap-2">
-                    <span class="w-1.5 h-5 bg-emerald-500 rounded-full inline-block"></span>动力与能耗
-                </h2>
-                <div class="space-y-4">
-                    <div class="flex justify-between items-center">
-                        <span class="text-slate-400 text-sm">表显总里程</span>
-                        <span class="font-mono text-lg tracking-tight">{{ status.totalOdometer || 0 }} <span class="text-xs text-slate-500 ml-0.5">km</span></span>
-                    </div>
-                    <div class="flex justify-between items-center">
-                        <span class="text-slate-400 text-sm">剩余油量</span>
-                        <span class="font-mono text-lg text-amber-400 tracking-tight">{{ status.fuelLeftover || 0 }} <span class="text-xs text-amber-600/70 ml-0.5">L</span></span>
-                    </div>
-                    <div class="flex justify-between items-center">
-                        <span class="text-slate-400 text-sm">预估续航</span>
-                        <span class="font-mono text-lg text-emerald-400 tracking-tight">{{ status.remainedOilMile || 0 }} <span class="text-xs text-emerald-600/70 ml-0.5">km</span></span>
-                    </div>
+            <!-- ================= 底部胎压区 ================= -->
+            <div class="mt-6 bg-slate-800 p-6 rounded-xl border border-slate-700 shadow-lg text-center relative overflow-hidden">
+                <div class="flex justify-center items-center gap-2 mb-6">
+                    <h2 class="text-sm font-bold text-slate-300">四轮动态胎压 (kPa)</h2>
+                    <!-- 融合：胎压综合告警灯 -->
+                    <span class="text-xs px-2 py-0.5 rounded-full" :class="(status.lfPressureWarning||0)+(status.rfPressureWarning||0)+(status.lrPressureWarning||0)+(status.rrPressureWarning||0) === 0 ? 'bg-emerald-500/10 text-emerald-400' : 'bg-red-500/20 text-red-400 animate-pulse'">
+                        {{ (status.lfPressureWarning||0)+(status.rfPressureWarning||0)+(status.lrPressureWarning||0)+(status.rrPressureWarning||0) === 0 ? '气压正常' : '气压异常报警！' }}
+                    </span>
                 </div>
-
-                <div class="mt-5 pt-4 border-t border-slate-700/60 flex justify-between items-center">
-                    <div>
-                        <span class="text-slate-400 text-sm flex items-center gap-1.5">
-                            <svg class="w-4 h-4 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8.111 16.404a5.5 5.5 0 017.778 0M12 20h.01m-7.08-7.071c3.904-3.905 10.236-3.905 14.141 0M1.394 9.393c5.857-5.857 15.355-5.857 21.213 0"></path></svg>
-                            车机流量
-                        </span>
-                        <p class="text-[11px] text-slate-500 mt-1">到期: {{ traffic.expireDate || '--' }}</p>
-                    </div>
-                    <div class="text-right">
-                        <span class="font-mono text-xl text-blue-400">{{ traffic.left || 0 }}</span>
-                        <span class="text-xs text-blue-500 ml-1">{{ traffic.unit || 'MB' }}</span>
-                    </div>
+                <div class="grid grid-cols-2 md:grid-cols-4 gap-6 relative z-10">
+                    <div class="bg-slate-900/80 py-4 rounded-lg border border-slate-700/50 hover:border-emerald-500/50 transition"><p class="text-xs text-slate-400 mb-2">左前轮</p><p class="text-2xl font-bold font-mono" :class="(status.lfPressureWarning||0)>0?'text-red-500 animate-pulse':'text-emerald-400'">{{ status.lfTyrePressure || '--' }}</p></div>
+                    <div class="bg-slate-900/80 py-4 rounded-lg border border-slate-700/50 hover:border-emerald-500/50 transition"><p class="text-xs text-slate-400 mb-2">右前轮</p><p class="text-2xl font-bold font-mono" :class="(status.rfPressureWarning||0)>0?'text-red-500 animate-pulse':'text-emerald-400'">{{ status.rfTyrePressure || '--' }}</p></div>
+                    <div class="bg-slate-900/80 py-4 rounded-lg border border-slate-700/50 hover:border-emerald-500/50 transition"><p class="text-xs text-slate-400 mb-2">左后轮</p><p class="text-2xl font-bold font-mono" :class="(status.lrPressureWarning||0)>0?'text-red-500 animate-pulse':'text-emerald-400'">{{ status.lrTyrePressure || '--' }}</p></div>
+                    <div class="bg-slate-900/80 py-4 rounded-lg border border-slate-700/50 hover:border-emerald-500/50 transition"><p class="text-xs text-slate-400 mb-2">右后轮</p><p class="text-2xl font-bold font-mono" :class="(status.rrPressureWarning||0)>0?'text-red-500 animate-pulse':'text-emerald-400'">{{ status.rrTyrePressure || '--' }}</p></div>
                 </div>
             </div>
+        </div>
 
-            <div class="bg-slate-800 rounded-2xl p-5 shadow-xl border border-slate-700/80 relative overflow-hidden">
-                <div class="absolute top-0 right-0 w-24 h-24 bg-purple-500/10 rounded-bl-full -z-10"></div>
-                <h2 class="text-lg font-semibold mb-5 text-slate-200 flex items-center gap-2">
-                    <span class="w-1.5 h-5 bg-purple-500 rounded-full inline-block"></span>车身状态
-                </h2>
-                <div class="grid grid-cols-2 gap-y-5 gap-x-6">
-                    <div>
-                        <p class="text-slate-500 text-xs mb-1">发动机状态</p>
-                        <p class="font-medium" :class="status.engineStatus === 2 ? 'text-slate-300' : 'text-emerald-400 animate-pulse'">
-                            {{ status.engineStatus === 2 ? '已熄火' : '运行中' }}
-                        </p>
-                    </div>
-                    <div>
-                        <p class="text-slate-500 text-xs mb-1">车外环境温度</p>
-                        <p class="font-mono text-slate-200">{{ status.environmentalTemp || '--' }}<span class="text-xs text-slate-500 ml-1">°C</span></p>
-                    </div>
-                    <div>
-                        <p class="text-slate-500 text-xs mb-1">主驾车门锁</p>
-                        <p class="font-medium flex items-center gap-1" :class="status.leftFrontDoorLock === 0 ? 'text-emerald-400' : 'text-red-400'">
-                            <span v-if="status.leftFrontDoorLock === 0" class="w-2 h-2 rounded-full bg-emerald-400"></span>
-                            <span v-else class="w-2 h-2 rounded-full bg-red-400 animate-ping"></span>
-                            {{ status.leftFrontDoorLock === 0 ? '已落锁' : '未落锁' }}
-                        </p>
-                    </div>
-                    <div>
-                        <p class="text-slate-500 text-xs mb-1">后备箱状态</p>
-                        <p class="font-medium" :class="status.trunk === 0 ? 'text-emerald-400' : 'text-amber-400'">
-                            {{ status.trunk === 0 ? '已关闭' : '开启中' }}
-                        </p>
-                    </div>
+        <!-- ================= 核心：极客诊断抽屉面板 (全量翻译版) ================= -->
+        <div v-if="showDiagnostics" class="fixed inset-0 bg-slate-950/95 backdrop-blur-md z-[100] flex flex-col transition-all">
+            <div class="p-5 md:p-6 border-b border-slate-800 flex justify-between items-center bg-slate-900 shadow-xl">
+                <div>
+                    <h2 class="text-xl md:text-2xl font-bold text-blue-400 font-mono tracking-widest flex items-center gap-3">
+                        <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4"></path></svg>
+                        CAN 总线原始数据流诊断
+                    </h2>
+                    <p class="text-slate-500 text-xs mt-1 uppercase tracking-widest">包含 120+ 传感器节点 (已中文映射)</p>
                 </div>
-                <div class="mt-5 pt-4 border-t border-slate-700/60 grid grid-cols-4 text-center">
-                    <div><p class="text-[10px] text-slate-500 mb-0.5">左前</p><p class="text-sm font-mono" :class="status.lfTyrePressure < 200 ? 'text-red-400' : 'text-slate-300'">{{ status.lfTyrePressure || '--' }}</p></div>
-                    <div><p class="text-[10px] text-slate-500 mb-0.5">右前</p><p class="text-sm font-mono" :class="status.rfTyrePressure < 200 ? 'text-red-400' : 'text-slate-300'">{{ status.rfTyrePressure || '--' }}</p></div>
-                    <div><p class="text-[10px] text-slate-500 mb-0.5">左后</p><p class="text-sm font-mono" :class="status.lrTyrePressure < 200 ? 'text-red-400' : 'text-slate-300'">{{ status.lrTyrePressure || '--' }}</p></div>
-                    <div><p class="text-[10px] text-slate-500 mb-0.5">右后</p><p class="text-sm font-mono" :class="status.rrTyrePressure < 200 ? 'text-red-400' : 'text-slate-300'">{{ status.rrTyrePressure || '--' }}</p></div>
-                </div>
+                <button @click="showDiagnostics = false" class="text-slate-400 hover:text-white p-2 bg-slate-800 rounded border border-slate-700 hover:border-slate-500 transition">
+                    <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
+                </button>
             </div>
-
-            <div class="bg-slate-800 rounded-2xl p-5 shadow-xl border border-slate-700/80 md:col-span-2 relative overflow-hidden">
-                <div class="absolute top-0 right-0 w-32 h-32 bg-rose-500/5 rounded-bl-full -z-10"></div>
-                <h2 class="text-lg font-semibold mb-4 text-slate-200 flex items-center gap-2">
-                    <span class="w-1.5 h-5 bg-rose-500 rounded-full inline-block"></span>末次上报位置
-                </h2>
-                <div class="flex flex-col md:flex-row justify-between items-start md:items-center gap-4">
-                    <div class="flex items-start gap-3">
-                        <div class="mt-1 p-2 bg-slate-900 rounded-lg border border-slate-700">
-                            <svg class="w-5 h-5 text-rose-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 11a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
-                        </div>
-                        <div>
-                            <p class="text-lg font-medium text-slate-100">{{ location.city || '未知城市' }}</p>
-                            <p class="text-sm text-slate-400 mt-0.5">{{ location.address || '等待卫星定位解析...' }}</p>
-                        </div>
-                    </div>
-                    <div class="flex gap-6 bg-slate-900/50 px-4 py-2.5 rounded-lg border border-slate-700/50 w-full md:w-auto">
-                        <div>
-                            <p class="text-[10px] text-slate-500 uppercase tracking-widest mb-0.5">Longitude</p>
-                            <p class="font-mono text-sm text-slate-300">{{ location.lng || '0.000000' }}</p>
-                        </div>
-                        <div>
-                            <p class="text-[10px] text-slate-500 uppercase tracking-widest mb-0.5">Latitude</p>
-                            <p class="font-mono text-sm text-slate-300">{{ location.lat || '0.000000' }}</p>
+            
+            <div class="flex-1 overflow-y-auto p-4 md:p-6 bg-[radial-gradient(ellipse_at_top,_var(--tw-gradient-stops))] from-slate-900 via-slate-950 to-black">
+                <div class="diagnostic-grid">
+                    <div v-for="item in rawDiagnostics" :key="item.key" class="bg-slate-900/80 p-3.5 rounded-lg border border-slate-800 hover:border-blue-500/50 hover:bg-slate-800 transition-all group">
+                        <div class="text-sm font-bold text-slate-300 mb-0.5 group-hover:text-blue-400 transition">{{ item.cnName }}</div>
+                        <div class="text-[10px] text-slate-600 font-mono mb-2 break-all">{{ item.key }}</div>
+                        <div class="font-mono text-base break-all" :class="item.value === 'null' ? 'text-slate-600' : 'text-emerald-400'">
+                            {{ item.value }}
                         </div>
                     </div>
                 </div>
             </div>
         </div>
+
+        <!-- 设置弹窗 -->
+        <div v-if="showSettings" class="fixed inset-0 bg-black/80 flex items-center justify-center p-4 z-50">
+            <div class="bg-slate-800 p-6 rounded-xl w-full max-w-sm border border-slate-600 shadow-2xl">
+                <h2 class="text-lg font-bold text-white mb-4">系统配置</h2>
+                <input v-model="configForm.carId" placeholder="CarId" class="w-full bg-slate-900 p-3 mb-3 rounded border border-slate-700 text-sm font-mono text-slate-300">
+                <textarea v-model="configForm.token" placeholder="Token" class="w-full bg-slate-900 p-3 mb-4 rounded border border-slate-700 h-24 text-sm font-mono text-slate-300"></textarea>
+                <div class="flex gap-3">
+                    <button @click="showSettings=false" class="flex-1 bg-slate-700 hover:bg-slate-600 transition p-2.5 rounded text-sm">取消</button>
+                    <button @click="saveConfig" class="flex-1 bg-emerald-600 hover:bg-emerald-500 transition p-2.5 rounded text-white text-sm">保存生效</button>
+                </div>
+            </div>
+        </div>
+
     </div>
 
     <script>
-        const { createApp, ref, onMounted } = Vue
+        const { createApp, ref, onMounted, computed } = Vue
+
+        // 汉化字典
+        const DICTIONARY = {
+            'totalOdometer': '车辆总里程', 'fuelLeftover': '剩余油量(L)', 'remainedOilMile': '预估剩余续航(km)',
+            'batteryVoltage': '蓄电池电压(V)', 'lfTyrePressure': '左前胎压(kPa)', 'rfTyrePressure': '右前胎压(kPa)',
+            'lrTyrePressure': '左后胎压(kPa)', 'rrTyrePressure': '右后胎压(kPa)', 'engineStatus': '发动机状态',
+            'leftFrontDoorLock': '左前门落锁', 'trunk': '后备箱状态', 'hood': '引擎盖状态',
+            'airConditioningSetTemperature': '空调设定温度', 'environmentalTemp': '车外环境温度', 'vehicleSpeed': '仪表盘车速',
+            'engineSpeed': '发动机转速(rpm)', 'engineWaterTemp': '发动机水温(°C)', 'remainingFuel': '油量百分比(%)',
+            'lowOilPressureFlag': '机油压力告警', 'maintainMileageRemaind': '距离保养剩余', 'absStatus': 'ABS防抱死状态',
+            'airbagSystemStatus': '安全气囊状态', 'transmissionSystemStatus': '变速箱状态', 'keyLowPower': '智能钥匙电量',
+            'diverWindow': '主驾车窗状态', 'passengerWindow': '副驾车窗状态', 'leftRearWindow': '左后车窗状态',
+            'rightRearWindow': '右后车窗状态', 'sunroof': '天窗状态', 'pm25': '车内PM2.5指数',
+            'airPurifierStatus': '空气净化器状态', 'signaIntensity': '网络信号强度(%)', 'satNum': 'GPS搜星数量',
+            'alti': '当前海拔高度(m)', 'heading': '车头偏航角(度)', 'gpsTime': '卫星定位时间',
+            'lowBeam': '近光灯状态', 'highBeam': '远光灯状态', 'frontFogLight': '前雾灯状态',
+            'rearFogLight': '后雾灯状态', 'positionLight': '示宽灯/日行灯', 'driverSeatHeatStatus': '主驾座椅加热档位',
+            'passengerSeatHeatStatus': '副驾座椅加热档位', 'driverSeatAirStatus': '主驾座椅通风档位', 'passengerSeatAirStatus': '副驾座椅通风档位',
+            'airQualityInCarLevel': '车内空气质量等级', 'airRecycleStatus': '空调内外循环', 'lfPressureWarning': '左前胎压报警器',
+            'rfPressureWarning': '右前胎压报警器', 'lrPressureWarning': '左后胎压报警器', 'rrPressureWarning': '右后胎压报警器',
+            'vehicleStabilityControlSystemStatus': 'ESP车身稳定系统', 'assistantSteeringStatus': 'EPS电子助力转向', 'engineCoolantStatus': '冷却液高温报警',
+            'ignitionTime': '本次点火时间', 'igniteCumulativeOil': '本次行驶耗油量(L)', 'speed': 'GPS真实测绘车速',
+            'vin': '车辆识别码(VIN)', 'carConfCode': '车型配置代码', 'igniteCumulativeMileage': '本次行驶里程',
+            'fuelConsumption100km': '表显平均油耗', 'trackFuelConsumption100km': '长期平均油耗', 'networkType': '车机网络类型',
+            'validGps': 'GPS定位是否有效', 'leftFrontDoor': '左前门开闭', 'rightFrontDoor': '右前门开闭',
+            'leftRearDoor': '左后门开闭', 'rightRearDoor': '右后门开闭', 'driverDoorLock': '主驾落锁',
+            'passengerDoorLock': '副驾落锁', 'leftRearDoorLock': '左后落锁', 'rightRearDoorLock': '右后落锁'
+        };
 
         createApp({
             setup() {
-                // 响应式数据
-                const status = ref({}); 
-                const location = ref({}); 
-                const traffic = ref({}); // 新增流量对象
-                const lastUpdate = ref("--");
-                
-                const hasConfig = ref(true); 
-                const showSettings = ref(false);
+                const status = ref({}); const location = ref({}); const traffic = ref({}); const report = ref({}); const report_yesterday = ref({}); const messages = ref([]);
+                const lastUpdate = ref("--"); const hasConfig = ref(true); 
+                const showSettings = ref(false); const showDiagnostics = ref(false);
                 const configForm = ref({ carId: '', token: '' });
 
-                // 从后端拉取最新数据
-                const fetchData = async () => {
-                    try {
-                        const res = await fetch('/api/car-status');
-                        const json = await res.json();
-                        hasConfig.value = json.has_config;
-                        
-                        if (json.code === 200 && json.data) {
-                            status.value = json.data.status || {};
-                            location.value = json.data.location || {};
-                            traffic.value = json.data.traffic || {}; // 赋值流量数据
-                            lastUpdate.value = json.data.last_update || "--";
-                        }
-                    } catch (e) {
-                        console.error("拉取数据失败", e);
-                    }
-                };
-
-                // 从后端拉取当前配置（用于回显到设置面板）
-                const fetchConfig = async () => {
-                    try {
-                        const res = await fetch('/api/config');
-                        const json = await res.json();
-                        if(json.data) {
-                            configForm.value.carId = json.data.carId || '';
-                            configForm.value.token = json.data.token || '';
-                            if(!json.data.token) hasConfig.value = false;
-                        }
-                    } catch (e) { console.error(e); }
-                };
-
-                // 保存配置到后端
-                const saveConfig = async () => {
-                    if (!configForm.value.carId || !configForm.value.token) {
-                        alert("CarId 和 Token 不能为空！");
-                        return;
-                    }
-                    try {
-                        await fetch('/api/config', {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify(configForm.value)
-                        });
-                        showSettings.value = false;
-                        hasConfig.value = true;
-                        lastUpdate.value = "正在重新同步...";
-                        
-                        // 稍微延迟一下，给后端脚本去长安服务器拿数据的时间
-                        setTimeout(fetchData, 2000); 
-                    } catch (e) { 
-                        alert("保存配置失败，请检查网络"); 
-                    }
-                };
-
-                onMounted(() => {
-                    fetchConfig();
-                    fetchData();
-                    // 前端每 10 秒去自己服务器读一次缓存数据（不耗费长安服务器资源）
-                    setInterval(fetchData, 10000); 
+                const rawDiagnostics = computed(() => {
+                    if(!status.value) return [];
+                    return Object.keys(status.value).sort().map(k => ({
+                        key: k,
+                        cnName: DICTIONARY[k] || '未定义扩展参数',
+                        value: status.value[k] === null || status.value[k] === undefined ? 'null' 
+                               : typeof status.value[k] === 'object' ? JSON.stringify(status.value[k]) 
+                               : String(status.value[k])
+                    }));
                 });
 
+                const fetchData = async () => {
+                    try {
+                        const res = await (await fetch('/api/car-status')).json();
+                        hasConfig.value = res.has_config;
+                        if (res.data) {
+                            status.value = res.data.status || {};
+                            location.value = res.data.location || {};
+                            traffic.value = res.data.traffic || {};
+                            report.value = res.data.report || {};
+                            report_yesterday.value = res.data.report_yesterday || {};
+                            messages.value = res.data.messages || [];
+                            lastUpdate.value = res.data.last_update || "未知";
+                        }
+                    } catch (e) {}
+                };
+
+                const fetchConfig = async () => {
+                    const res = await (await fetch('/api/config')).json();
+                    if(res.data) {
+                        configForm.value.carId = res.data.carId || '';
+                        configForm.value.token = res.data.token || '';
+                        if(!res.data.token) hasConfig.value = false;
+                    }
+                };
+
+                const saveConfig = async () => {
+                    await fetch('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(configForm.value) });
+                    showSettings.value = false;
+                    setTimeout(fetchData, 2000);
+                };
+
+                onMounted(() => { fetchConfig(); fetchData(); setInterval(fetchData, 10000); });
+                
                 return { 
-                    status, location, traffic, lastUpdate, 
-                    hasConfig, showSettings, configForm, 
-                    saveConfig 
+                    status, location, traffic, report, report_yesterday, messages, lastUpdate, 
+                    hasConfig, showSettings, configForm, saveConfig,
+                    showDiagnostics, rawDiagnostics
                 }
             }
         }).mount('#app')
