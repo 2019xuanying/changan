@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <title>系统管理后台 - UNI-V</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+</head>
+<body class="bg-slate-900 text-slate-200 p-6 min-h-screen">
+    <div id="admin" class="max-w-4xl mx-auto">
+        <h1 class="text-2xl font-bold text-emerald-400 mb-6 flex items-center gap-2">
+            <svg class="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z"></path><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"></path></svg>
+            车队安全管理中心
+        </h1>
+        
+        <div v-if="!isAuth" class="bg-slate-800 p-8 rounded-xl max-w-sm border border-slate-700 shadow-2xl">
+            <h2 class="mb-4 text-lg font-bold">验证管理员身份</h2>
+            <input v-model="pass" type="password" placeholder="请输入超级密码" class="w-full p-3 rounded bg-slate-900 border border-slate-700 mb-4 focus:outline-none focus:border-emerald-500">
+            <button @click="login" class="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 rounded transition">安全登录</button>
+        </div>
+
+        <div v-else class="grid grid-cols-1 md:grid-cols-2 gap-6">
+            <div class="bg-slate-800 p-6 rounded-xl border border-slate-700">
+                <h2 class="text-lg font-bold mb-4 border-b border-slate-700 pb-2">已分配车辆 ({{ Object.keys(list).length }})</h2>
+                <div class="space-y-3">
+                    <div v-for="(car, vid) in list" :key="vid" class="p-3 bg-slate-900 rounded border border-slate-700">
+                        <div class="flex justify-between items-start mb-2">
+                            <div>
+                                <p class="font-bold text-emerald-400">{{ car.name }}</p>
+                                <p class="text-[10px] text-slate-500 font-mono mt-1">CarID: {{ car.carId }}</p>
+                            </div>
+                            <button @click="remove(vid)" class="text-red-400 hover:text-red-300 text-xs">删除</button>
+                        </div>
+                        <div class="mt-2 pt-2 border-t border-slate-800">
+                            <p class="text-xs text-slate-400 mb-1">监控专属链接 (请复制发给车主):</p>
+                            <div class="flex">
+                                <input readonly :value="publicIP + '/?vid=' + vid" class="flex-1 bg-black/50 text-[11px] text-blue-400 p-1.5 rounded-l border border-slate-700 focus:outline-none">
+                                <a :href="publicIP + '/?vid=' + vid" target="_blank" class="bg-blue-600 hover:bg-blue-500 text-white px-3 py-1.5 rounded-r text-xs flex items-center">访问</a>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="bg-slate-800 p-6 rounded-xl border border-slate-700 h-fit">
+                <h2 class="text-lg font-bold mb-4 border-b border-slate-700 pb-2">接入新车辆</h2>
+                <div class="space-y-3">
+                    <input v-model="form.name" placeholder="车辆备注名称" class="w-full p-2.5 rounded bg-slate-900 border border-slate-700 text-sm focus:border-emerald-500">
+                    <input v-model="form.carId" placeholder="车机 ID (carId)" class="w-full p-2.5 rounded bg-slate-900 border border-slate-700 text-sm font-mono focus:border-emerald-500">
+                    <textarea v-model="form.token" placeholder="抓包 Token" class="w-full p-2.5 rounded bg-slate-900 border border-slate-700 text-sm font-mono h-24 focus:border-emerald-500"></textarea>
+                    <button @click="add" class="w-full bg-indigo-600 hover:bg-indigo-500 text-white font-bold py-2.5 rounded transition">分配并生效</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    <script>
+        const { createApp, ref, computed } = Vue;
+        createApp({
+            setup() {
+                const isAuth = ref(false);
+                const pass = ref('');
+                const list = ref({});
+                const form = ref({name:'', carId:'', token:''});
+                
+                const publicIP = computed(() => {
+                    const l = window.location;
+                    return l.protocol + '//' + l.hostname + ':5000';
+                });
+
+                const req = async (method, body=null, query='') => {
+                    return fetch('/api/vehicles' + query, { 
+                        method, 
+                        headers: {'X-Admin-Pass': pass.value, 'Content-Type': 'application/json'},
+                        body: body ? JSON.stringify(body) : null
+                    });
+                };
+
+                const login = async () => {
+                    const r = await req('GET');
+                    if(r.ok) { isAuth.value = true; list.value = await r.json(); }
+                    else alert("管理密码错误");
+                };
+
+                const add = async () => {
+                    if(!form.value.carId || !form.value.token) return alert("信息不全");
+                    await req('POST', form.value);
+                    form.value = {name:'', carId:'', token:''};
+                    login();
+                };
+
+                const remove = async (vid) => {
+                    if(confirm("确定要删除此车辆及监控页面吗？")) {
+                        await req('DELETE', null, '?vid='+vid);
+                        login();
+                    }
+                };
+
+                return { isAuth, pass, list, form, login, add, remove, publicIP }
+            }
+        }).mount('#admin')
+    </script>
+</body>
+</html>
